@@ -1,0 +1,87 @@
+# ====================
+# Python 基础
+# ====================
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# ====================
+# 虚拟环境
+# ====================
+venv/
+env/
+ENV/
+.venv
+env/
+.env
+
+# ====================
+# IDE / 编辑器
+# ====================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ====================
+# 项目特定：数据缓存
+# ====================
+stock_data_cache/
+*.parquet
+*.csv
+
+# ====================
+# 模型文件（训练输出）
+# ====================
+*.pth
+*.pkl
+*.pt
+model_*.pth
+scaler_*.pkl
+
+# ====================
+# 日志文件
+# ====================
+logs/
+*.log
+
+# ====================
+# 回测输出结果（可选，如果你不需要提交 CSV 结果）
+# ====================
+window_*.csv
+expanding_window_summary.csv
+batch_results.csv
+pool_backtest_results.csv
+pool_metrics.csv
+*.png
+*.jpg
+*.csv
+
+# ====================
+# 临时文件
+# ====================
+tmp/
+temp/
+*.tmp
+*.bak
+
+# ====================
+# 操作系统
+# ====================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+test.py
+66ip.py
+ai.py
+
+!pool_curve.png
