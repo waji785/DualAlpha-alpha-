@@ -16,7 +16,7 @@ logger = setup_logger(__name__)
 SIGNALS_FILE = os.path.join(OUTPUT_DIR, "today_signals.csv")
 POSITION_FILE = os.path.join(OUTPUT_DIR, "positions.json")
 TRADE_LOG = os.path.join(OUTPUT_DIR, "trade_log.csv")
-POLL_INTERVAL = 5
+POLL_INTERVAL = 60  # 秒
 VOL_SPIKE = 1.5
 COMMISSION = 0.0003    # 佣金 万3
 STAMP_TAX = 0.001      # 印花税（仅卖出）
@@ -72,25 +72,36 @@ class SimTrader:
                 'today_bought': list(self.today_bought),
             }, f, indent=2)
 
-    def fetch_quotes(self):
+def fetch_quotes(self):
+    codes = set(self.signals.keys()) | set(self.positions.keys())
+    if not codes: return {}
+    # sina 实时行情（主力）
+    try:
+        import requests, re
+        sina = ','.join(f"{'sh' if c.startswith('6') else 'sz'}{c}" for c in codes)
+        r = requests.get(f"http://hq.sinajs.cn/list={sina}",
+                         headers={'Referer':'http://finance.sina.com.cn'}, timeout=5)
+        r.encoding='gbk'; quotes={}
+        for m in re.finditer(r'hq_str_(\w+)="(.+?)"', r.text):
+            code=m.group(1)[2:]; p=m.group(2).split(',')
+            if len(p)>=32 and float(p[3])>0:
+                quotes[code]={'price':float(p[3]),'volume':float(p[8]),
+                    'high':float(p[4]),'low':float(p[5]),
+                    'pct':(float(p[3])/float(p[2])-1)*100}
+        if quotes: self.fetch_ok+=1; return quotes
+    except: pass
+    # akshare 备选（5分钟一次防封）
+    if self.tick_count%60==0:
         try:
-            import akshare as ak
-            df = ak.stock_zh_a_spot_em()
-            codes = set(self.signals.keys()) | set(self.positions.keys())
-            quotes = {}
-            for _, r in df.iterrows():
-                code = str(r['代码']).zfill(6)
-                if code in codes:
-                    quotes[code] = {
-                        'price': float(r['最新价']), 'volume': float(r['成交量']),
-                        'high': float(r['最高']), 'low': float(r['最低']),
-                        'pct': float(r['涨跌幅']),
-                    }
-            self.fetch_ok += 1
-            return quotes
-        except Exception:
-            self.fetch_fail += 1
-            return {}
+            import akshare as ak; df=ak.stock_zh_a_spot_em(); quotes={}
+            for _,r in df.iterrows():
+                c=str(r['代码']).zfill(6)
+                if c in codes and c not in quotes:
+                    quotes[c]={'price':float(r['最新价']),'volume':float(r['成交量']),
+                        'high':float(r['最高']),'low':float(r['最低']),'pct':float(r['涨跌幅'])}
+            self.fetch_ok+=1; return quotes
+        except: self.fetch_fail+=1
+    self.fetch_ok+=1; return {}
 
     def _trade_cost(self, amount, is_sell=False):
         """实际到账金额 = 成交额 - 佣金 - 印花税"""
@@ -214,13 +225,12 @@ class SimTrader:
                 if self.tick_count == 0:
                     logger.info(f"⏳ 非交易时间 ({dt.now().strftime('%H:%M')}), 等待中...")
                     self.tick_count = 1
-                time.sleep(30); continue
+                time.sleep(POLL_INTERVAL); continue
             q = self.fetch_quotes()
             self.tick_count += 1
             if q:
                 self.on_tick(q)
-            # 每分钟心跳
-            if self.tick_count % 12 == 0:
+            # 每次获取数据都打心跳
                 self.print_status(q) if self.positions else None
                 nq = len(q)
                 logger.info(f"💓 {dt.now().strftime('%H:%M')} 行情{nq}只 "
