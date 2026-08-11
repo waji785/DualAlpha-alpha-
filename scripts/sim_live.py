@@ -32,6 +32,8 @@ class SimTrader:
         self.signals = {}
         self.prev_vol = {}
         self.tick_count = 0
+        self.fetch_ok = 0
+        self.fetch_fail = 0
 
     def load_signals(self):
         if not os.path.exists(SIGNALS_FILE):
@@ -49,6 +51,9 @@ class SimTrader:
             }
         buys = sum(1 for s in self.signals.values() if s['signal'] == '买入')
         logger.info(f"盘前信号: {len(self.signals)}只, 买入{buys}只")
+        self.regime_mult = float(df['regime_mult'].iloc[0]) if 'regime_mult' in df.columns else 1.0
+        if self.regime_mult < 1.0:
+            logger.warning(f"⚠ 仓位系数={self.regime_mult}")
         self.load_positions()
         return True
 
@@ -81,8 +86,10 @@ class SimTrader:
                         'high': float(r['最高']), 'low': float(r['最低']),
                         'pct': float(r['涨跌幅']),
                     }
+            self.fetch_ok += 1
             return quotes
         except Exception:
+            self.fetch_fail += 1
             return {}
 
     def _trade_cost(self, amount, is_sell=False):
@@ -132,7 +139,7 @@ class SimTrader:
                 self.prev_vol[code] = q['volume']
                 continue
 
-            target_pos = min((sig['up_prob'] - 0.45) * 1.0, MAX_POSITION)
+            target_pos = min((sig['up_prob'] - 0.45) * 1.0, MAX_POSITION) * self.regime_mult
             if price < sig['close'] * 0.97:
                 target_pos *= 0.5
 
@@ -204,13 +211,20 @@ class SimTrader:
         logger.info("模拟盘启动")
         while True:
             if not self.is_trading():
+                if self.tick_count == 0:
+                    logger.info(f"⏳ 非交易时间 ({dt.now().strftime('%H:%M')}), 等待中...")
+                    self.tick_count = 1
                 time.sleep(30); continue
             q = self.fetch_quotes()
+            self.tick_count += 1
             if q:
                 self.on_tick(q)
-                self.tick_count += 1
-                if self.tick_count % 360 == 0:  # 每 30 分钟
-                    self.print_status(q)
+            # 每分钟心跳
+            if self.tick_count % 12 == 0:
+                self.print_status(q) if self.positions else None
+                nq = len(q)
+                logger.info(f"💓 {dt.now().strftime('%H:%M')} 行情{nq}只 "
+                           f"持仓{len(self.positions)} OK={self.fetch_ok} 失败={self.fetch_fail}")
             self.save_positions()
             time.sleep(POLL_INTERVAL)
 
