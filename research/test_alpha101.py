@@ -10,6 +10,7 @@ import pandas as pd
 
 from research.factor_lab import FactorLab
 from research.alpha101 import ALL_ALPHAS
+from research.alpha158 import ALL_ALPHA158
 from core.data_loader import load_from_cache
 
 # 测试股票池（主要指数成分股）
@@ -74,6 +75,40 @@ def main():
     # 滚动窗口分析
     print("\n\n滚动窗口分析 (15只股票x10年全量):")
     lab.rolling_window_analysis(ALL_ALPHAS, code_list=TEST_CODES[:15], n_samples=15, window_years=10)
+
+    # Alpha158 测试
+    print("\n\n" + "=" * 65)
+    print("Alpha158 因子测试")
+    print("=" * 65)
+    results158 = {}
+    for name, func in ALL_ALPHA158.items():
+        ics, nans = [], []
+        for code in TEST_CODES:
+            df = load_from_cache(code)
+            if df is None or len(df) < 300: continue
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.set_index('Date').sort_index()
+            try:
+                factor_series = func(df)
+                if isinstance(factor_series, (pd.Series, np.ndarray)):
+                    factor_series = pd.Series(factor_series, index=df.index)
+                result = lab.test_factor(name, lambda d: factor_series, df)
+                if 'ic' in result:
+                    ics.append(result['ic'])
+                    nans.append(result.get('nan_rate', 0))
+            except: pass
+        if ics:
+            results158[name] = {'ic_mean': round(np.mean(ics), 4),
+                                'ic_std': round(np.std(ics), 4),
+                                'stocks': len(ics)}
+    for name in sorted(results158, key=lambda k: abs(results158[k]['ic_mean']), reverse=True):
+        r = results158[name]
+        stars = '★★★' if abs(r['ic_mean'])>0.03 else '★★' if abs(r['ic_mean'])>0.02 else '★' if abs(r['ic_mean'])>0.01 else '-'
+        print(f"{name:12s} {r['ic_mean']:+8.4f} {r['ic_std']:8.4f} {r['stocks']:5d} {stars:6s}")
+    print("=" * 65)
+    candidates158 = [n for n, r in results158.items() if abs(r['ic_mean']) > 0.02]
+    if candidates158:
+        print(f"\n✅ 推荐集成 ({len(candidates158)} 个): {', '.join(candidates158)}")
 
 
 if __name__ == "__main__":
