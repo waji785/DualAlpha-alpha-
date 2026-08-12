@@ -72,8 +72,8 @@ def main():
         print(f"   加入 config/settings.py 的 FEATURE_COLS 即可")
 
     # 滚动窗口分析
-    print("\n\n滚动窗口分析 (30只股票x1年窗口):")
-    lab.rolling_window_analysis(ALL_ALPHAS, code_list=TEST_CODES[:15], n_samples=15)
+    print("\n\n滚动窗口分析 (15只股票x10年全量):")
+    lab.rolling_window_analysis(ALL_ALPHAS, code_list=TEST_CODES[:15], n_samples=15, window_years=10)
 
 
 if __name__ == "__main__":
