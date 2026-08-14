@@ -41,6 +41,9 @@ stock_data_cache/
 config/local_settings.py
 *.csv
 
+# 实盘状态（持仓数据，隐私）
+monthly_state.json
+
 # ====================
 # 模型文件（训练输出）
 # ====================
