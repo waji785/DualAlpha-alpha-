@@ -29,10 +29,11 @@ logger = setup_logger(__name__)
 def cmd_incremental(force_rebuild=False):
     dl = DataDownloader(end=TODAY)
     dl.run_incremental_update(force_rebuild=force_rebuild)
-    dl.print_report()
+    s = dl.stats
+    print(f"\n📊 总计:{s.get('total',0)} 成功:{s.get('success',0)} 失败:{s.get('failed',0)} 跳过:{s.get('skipped',0)}")
 
 
-def cmd_full(max_stocks, start="2018-01-01"):
+def cmd_full(max_stocks, start="2015-01-01"):
     dl = DataDownloader(start=start, end=TODAY)
     stock_df = dl.get_stock_list(exclude_st=True, exclude_north=True)
     if stock_df is None:
@@ -43,7 +44,8 @@ def cmd_full(max_stocks, start="2018-01-01"):
         codes = codes[:max_stocks]
     print(f"即将下载 {len(codes)} 只股票")
     dl.run_full_download(codes=codes)
-    dl.print_report()
+    s = dl.stats
+    print(f"\n📊 成功:{s.get('success',0)} 失败:{s.get('failed',0)} 跳过:{s.get('skipped',0)}")
 
 
 def cmd_single(code):
@@ -60,7 +62,8 @@ def cmd_single(code):
             print(f"⚠️  {code} 下载成功但缓存读取失败")
     else:
         print(f"❌ {code} 下载失败")
-    dl.print_report()
+    s = dl.stats
+    print(f"\n📊 成功:{s.get('success',0)} 失败:{s.get('failed',0)}")
 
 
 def cmd_validate():
@@ -82,7 +85,7 @@ def cmd_validate():
         else:
             dl.stats['validated_ok'] += 1
         dl.stats['success'] += 1
-    dl.print_report()
+    print(f"\n校验完成: 成功{dl.stats.get('success',0)} 警告{dl.stats.get('validated_warn',0)}")
 
 
 def main():
@@ -91,7 +94,7 @@ def main():
     parser.add_argument("--code", type=str, default=None, help="下载单只股票")
     parser.add_argument("--validate", action="store_true", help="校验缓存数据")
     parser.add_argument("--max", type=int, default=None, dest="max_stocks", help="限制下载数量")
-    parser.add_argument("--start", type=str, default="2018-01-01", help="起始日期")
+    parser.add_argument("--start", type=str, default="2015-01-01", help="起始日期")
     parser.add_argument("--force", action="store_true", help="强制全部重建特征（无数据下载）")
     args = parser.parse_args()
 

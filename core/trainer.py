@@ -1,6 +1,8 @@
 # core/trainer.py
 import os
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+import torch
+torch.set_float32_matmul_precision('medium')  # AMP 加速
 
 import pandas as pd
 import numpy as np
@@ -254,6 +256,7 @@ def train_and_save_model(df, train_end_date=None, model_save_path=MODEL_PATH,
         Xt, ypt, ydt = [], [], []
         ep_count = 0
         for idx in order:
+            MAX_SAMPLES_PER_EPOCH = 200000  # 78维降压
             f, tp, td, _, _ = meta[idx]
             x, yp, yd = create_sequences(f, tp, td, SEQ_LEN)
             remain = MAX_SAMPLES_PER_EPOCH - ep_count
@@ -289,43 +292,51 @@ def train_and_save_model(df, train_end_date=None, model_save_path=MODEL_PATH,
         model.train()
         tr_loss = 0.0
         optimizer.zero_grad()
+        # AMP 混合精度
+        use_amp = device.type == 'cuda'
+        scaler = torch.amp.GradScaler('cuda') if use_amp else None
         for i, (bx, bp, bd) in enumerate(tr_loader):
             bx, bp, bd = bx.to(device), bp.to(device), bd.to(device)
-            pr, pd_ = model(bx)
-            # 两阶段 / 不确定性加权
-            if CLASSIFICATION_FIRST and phase == 1:
-                loss = crit_cls(pd_, bd) / GRAD_ACCUM_STEPS
-            elif hasattr(model, 'log_var_reg'):
-                log_reg = torch.clamp(model.log_var_reg, -3.0, 3.0)
-                log_cls = torch.clamp(model.log_var_cls, -3.0, 3.0)
-                prec_reg = torch.exp(-log_reg)
-                prec_cls = torch.exp(-log_cls)
-                huber_h = F.smooth_l1_loss(pr, bp, reduction='none').mean(dim=0)
-                # 阶段2: 仅对高置信度样本算回归损失
-                if CLASSIFICATION_FIRST and phase == 2:
-                    cls_prob = torch.softmax(pd_, dim=1)
-                    mask = cls_prob.max(dim=1).values > PHASE2_CONFIDENCE
-                    if mask.sum() > 0:
-                        huber_h = F.smooth_l1_loss(pr[mask], bp[mask], reduction='none').mean(dim=0)
-                    else:
-                        # 全批次无高置信样本 → 跳过回归损失
-                        loss = crit_cls(pd_, bd) * prec_cls + log_cls.squeeze() + 1.0
-                        loss = loss / GRAD_ACCUM_STEPS
-                        loss.backward(); tr_loss += loss.item() * GRAD_ACCUM_STEPS
-                        continue
-                loss_reg = (huber_h * prec_reg).sum() + log_reg.sum() + NUM_HORIZONS
-                loss_cls = crit_cls(pd_, bd) * prec_cls + log_cls.squeeze() + 1.0
-                loss = (loss_reg + loss_cls) / GRAD_ACCUM_STEPS
-            else:
-                loss_reg = crit_reg(pr, bp)
-                loss_cls = crit_cls(pd_, bd)
-                loss = (loss_reg + loss_cls) / GRAD_ACCUM_STEPS
-            loss.backward()
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                pr, pd_ = model(bx)
+                # 两阶段 / 不确定性加权
+                if CLASSIFICATION_FIRST and phase == 1:
+                    loss = crit_cls(pd_, bd) / GRAD_ACCUM_STEPS
+                elif hasattr(model, 'log_var_reg'):
+                    log_reg = torch.clamp(model.log_var_reg, -3.0, 3.0)
+                    log_cls = torch.clamp(model.log_var_cls, -3.0, 3.0)
+                    prec_reg = torch.exp(-log_reg)
+                    prec_cls = torch.exp(-log_cls)
+                    huber_h = F.smooth_l1_loss(pr, bp, reduction='none').mean(dim=0)
+                    if CLASSIFICATION_FIRST and phase == 2:
+                        cls_prob = torch.softmax(pd_, dim=1)
+                        mask = cls_prob.max(dim=1).values > PHASE2_CONFIDENCE
+                        if mask.sum() > 0:
+                            huber_h = F.smooth_l1_loss(pr[mask], bp[mask], reduction='none').mean(dim=0)
+                        else:
+                            loss = crit_cls(pd_, bd) * prec_cls + log_cls.squeeze() + 1.0
+                            loss = loss / GRAD_ACCUM_STEPS
+                            if use_amp: scaler.scale(loss).backward()
+                            else: loss.backward()
+                            tr_loss += loss.item() * GRAD_ACCUM_STEPS
+                            continue
+                    loss_reg = (huber_h * prec_reg).sum() + log_reg.sum() + NUM_HORIZONS
+                    loss_cls = crit_cls(pd_, bd) * prec_cls + log_cls.squeeze() + 1.0
+                    loss = (loss_reg + loss_cls) / GRAD_ACCUM_STEPS
+                else:
+                    loss = (crit_reg(pr, bp) + crit_cls(pd_, bd)) / GRAD_ACCUM_STEPS
+            if use_amp: scaler.scale(loss).backward()
+            else: loss.backward()
             tr_loss += loss.item() * GRAD_ACCUM_STEPS
 
             if (i + 1) % GRAD_ACCUM_STEPS == 0 or (i + 1) == len(tr_loader):
+                if use_amp:
+                    scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-                optimizer.step()
+                if use_amp:
+                    scaler.step(optimizer); scaler.update()
+                else:
+                    optimizer.step()
                 optimizer.zero_grad()
                 # EMA 更新
                 if ema_model is not None:

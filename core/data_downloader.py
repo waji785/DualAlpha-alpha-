@@ -27,6 +27,26 @@ from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
+def _rebuild_one_stock(args):
+    """模块级函数：重建单只股票特征"""
+    cache_dir, code, start, end = args
+
+    from core.features import construct_features, clean_data
+    cache_file = os.path.join(cache_dir, f"{code}.parquet")
+    if not os.path.exists(cache_file): return code, False
+    import datetime as _dt
+    mtime = _dt.datetime.fromtimestamp(os.path.getmtime(cache_file))
+    if mtime > _dt.datetime.now() - _dt.timedelta(minutes=30):
+        return code, 'skip'
+    df = pd.read_parquet(cache_file)
+    df['Date'] = pd.to_datetime(df['Date'])
+    df = construct_features(df)
+    df = clean_data(df)
+    if len(df) > 50 and df['Close'].notna().sum() > 50:
+        df.to_parquet(cache_file, index=False)
+        return code, True
+    return code, False
+
 # ---- baostock / tushare 登录 ----
 import baostock as bs
 try:
@@ -76,11 +96,13 @@ _RENAME_MAP = {
 
 # ---- Tushare 下载 ----
 def _ts_download(stock_code, start, end):
+    import time
+    time.sleep(0.4)  # 限速：单线程下每只股票约 0.4s，避免触发 tushare 限流
     """tushare 日线 + 基本面"""
     from config.settings import TUSHARE_TOKEN
     if not _TS_AVAILABLE or TUSHARE_TOKEN == "your_token_here":
         return None
-    pro = ts.pro_api(TUSHARE_TOKEN)
+    pro = ts.pro_api(TUSHARE_TOKEN, timeout=10)
     s = stock_code.zfill(6)
     ts_code = f"{s}.SH" if s[0] == '6' else f"{s}.SZ"
     s_date = start.replace('-', '')
@@ -88,7 +110,18 @@ def _ts_download(stock_code, start, end):
     try:
         df1 = pro.daily(ts_code=ts_code, start_date=s_date, end_date=e_date)
         if df1 is None or len(df1) == 0:
+            import time; time.sleep(0.05)  # 限速退避
             return None
+        # 复权因子（后复权 = 价格 × adj_factor）
+        try:
+            df_adj = pro.adj_factor(ts_code=ts_code, start_date=s_date, end_date=e_date)
+            if df_adj is not None and len(df_adj) > 0:
+                df1 = df1.merge(df_adj[['trade_date', 'adj_factor']], on='trade_date', how='left')
+                af = df1['adj_factor'].fillna(1.0)
+                for c in ['open', 'high', 'low', 'close', 'pre_close']:
+                    df1[c] = (df1[c] * af).round(4)
+        except Exception:
+            pass
         df2 = pro.daily_basic(ts_code=ts_code, start_date=s_date, end_date=e_date)
         cols = ['trade_date', 'pe_ttm', 'pb', 'ps_ttm', 'turnover_rate']
         if df2 is not None and len(df2) > 0:
@@ -126,7 +159,7 @@ _FLOAT_COLS = ['Open', 'High', 'Low', 'Close', 'PreClose',
 # ============================================================
 
 class DataDownloader:
-    def __init__(self, start="2018-01-01", end=TODAY, cache_dir=None):
+    def __init__(self, start="2015-01-01", end=TODAY, cache_dir=None):
         self.start = start
         self.end = end
         self.cache_dir = cache_dir or CACHE_DIR
@@ -137,6 +170,7 @@ class DataDownloader:
             'validated_ok': 0, 'validated_warn': 0,
         }
         self.errors = []
+        self.fundamental_cache = None  # {ts_code: 季度财务 DataFrame}
 
     # ============================================================
     #  Stock List (baostock)
@@ -147,7 +181,7 @@ class DataDownloader:
         try:
             from config.settings import TUSHARE_TOKEN
             if _TS_AVAILABLE and TUSHARE_TOKEN != "your_token_here":
-                pro = ts.pro_api(TUSHARE_TOKEN)
+                pro = ts.pro_api(TUSHARE_TOKEN, timeout=10)
                 df = pro.stock_basic(exchange='', list_status='L',
                                      fields='ts_code,symbol,name,area,industry,list_date')
                 if df is not None and len(df) > 0:
@@ -205,6 +239,8 @@ class DataDownloader:
         baostock 日线下载，返回包含 OHLCV + PE/PB/PS/PCF 的 DataFrame。
         失败返回 None，错误信息存入 self._last_error。
         """
+        import socket
+        socket.setdefaulttimeout(15)  # baostock 超时保护（避免卡住下载）
         bs_symbol = _code_to_bs(stock_code)
         if bs_symbol is None:
             self._last_error = "代码无法转为 baostock 格式"
@@ -251,10 +287,11 @@ class DataDownloader:
             return None
 
     def download_and_save(self, stock_code, start=None, end=None):
-        """下载 → 校验 → 特征 → 缓存（优先 tushare，回退 baostock）"""
+        """下载 → 校验 → 特征 → 缓存（仅 tushare，失败重试一次后跳过）"""
         df = _ts_download(stock_code, start or self.start, end or self.end)
         if df is None:
-            df = self._download_raw(stock_code, start, end)
+            # tushare 偶发超时，重试一次；不再回退 baostock（baostock 会卡死）
+            df = _ts_download(stock_code, start or self.start, end or self.end)
         if df is not None:
             df.rename(columns=_RENAME_MAP, inplace=True)
             df['Date'] = pd.to_datetime(df['Date'])
@@ -280,19 +317,69 @@ class DataDownloader:
         else:
             self.stats['validated_ok'] += 1
 
+        # ---- 财务指标 merge（从批量缓存，quarter → daily 前向填充）----
+        if self.fundamental_cache:
+            s = stock_code.zfill(6)
+            ts_code = f"{s}.SH" if s[0] == '6' else f"{s}.SZ"
+            fund = self.fundamental_cache.get(ts_code)
+            if fund is not None and len(fund) > 0:
+                f = fund.copy()
+                # 前视修复：用披露日期 ann_date 而非报告期 end_date（财报有 1-3 月披露滞后）
+                if 'ann_date' in f.columns:
+                    f['Date'] = pd.to_datetime(f['ann_date'].fillna(f['end_date']))
+                else:
+                    f['Date'] = pd.to_datetime(f['end_date'])
+                f = f[['Date', 'roe', 'grossprofit_margin', 'netprofit_margin', 'debt_to_assets']].copy()
+                f.columns = ['Date', 'ROE', 'GrossMargin', 'NetMargin', 'DebtRatio']
+                f = f.sort_values('Date').drop_duplicates('Date', keep='last')
+                df = df.merge(f, on='Date', how='left')
+                for c in ['ROE', 'GrossMargin', 'NetMargin', 'DebtRatio']:
+                    df[c] = df[c].ffill().fillna(0.0)
+
+        # ---- 融资融券 merge（日频，融资余额变化率）----
+        s = stock_code.zfill(6)
+        ts_code = f"{s}.SH" if s[0] == '6' else f"{s}.SZ"
+        m = self.margin_cache.get(ts_code) if getattr(self, 'margin_cache', None) else None
+        if m is not None and len(m) > 0:
+            mm = m.copy()
+            mm['Date'] = pd.to_datetime(mm['trade_date'])
+            mm = mm.sort_values('Date').drop_duplicates('Date', keep='last')
+            df = df.merge(mm[['Date', 'rzye']], on='Date', how='left')
+            bal = df['rzye'].ffill()
+            df['Margin_Chg_5d'] = bal.pct_change(5).fillna(0.0)
+            df['Margin_Chg_20d'] = bal.pct_change(20).fillna(0.0)
+            df.drop(columns=['rzye'], inplace=True)
+        else:
+            df['Margin_Chg_5d'] = 0.0
+            df['Margin_Chg_20d'] = 0.0
+
+        # ---- 龙虎榜机构净买入 merge（事件数据，20 天累计）----
+        lhb = self.lhb_cache.get(ts_code) if getattr(self, 'lhb_cache', None) else None
+        if lhb is not None and len(lhb) > 0:
+            ll = lhb.copy()
+            ll['Date'] = pd.to_datetime(ll['trade_date'])
+            ll = ll.sort_values('Date').drop_duplicates('Date', keep='last')
+            df = df.merge(ll[['Date', 'net_buy']], on='Date', how='left')
+            df['LHB_Net_Buy_20d'] = df['net_buy'].fillna(0.0).rolling(20, min_periods=1).sum()
+            df.drop(columns=['net_buy'], inplace=True)
+        else:
+            df['LHB_Net_Buy_20d'] = 0.0
+
+        # ---- 大宗交易金额 merge（事件数据，20 天累计）----
+        blk = self.block_cache.get(ts_code) if getattr(self, 'block_cache', None) else None
+        if blk is not None and len(blk) > 0:
+            bb = blk.copy()
+            bb['Date'] = pd.to_datetime(bb['trade_date'])
+            bb = bb.sort_values('Date').drop_duplicates('Date', keep='last')
+            df = df.merge(bb[['Date', 'amount']], on='Date', how='left')
+            df['Block_Amount_20d'] = df['amount'].fillna(0.0).rolling(20, min_periods=1).sum()
+            df.drop(columns=['amount'], inplace=True)
+        else:
+            df['Block_Amount_20d'] = 0.0
+
         # 特征
         df = construct_features(df)
         df = clean_data(df)
-
-        # ---- 额外数据（北向/财务/股东）----
-        try:
-            from core.extra_data import fetch_extra_data
-            extra = fetch_extra_data(stock_code, self.start, self.end)
-            if extra is not None and len(extra) > 0:
-                df = pd.merge(df, extra, on='Date', how='left')
-                df.fillna({col: 0.0 for col in extra.columns if col != 'Date'}, inplace=True)
-        except Exception:
-            logger.debug(f"额外数据失败 {stock_code}")
 
         cache_file = os.path.join(self.cache_dir, f"{stock_code}.parquet")
         df.to_parquet(cache_file, index=False)
@@ -357,6 +444,177 @@ class DataDownloader:
         except Exception:
             return None
 
+    def _load_fundamentals(self, codes):
+        """加载财务指标：优先磁盘缓存，否则串行下载（逐股票 + 限速），返回 {ts_code: 季度财务 DataFrame}"""
+        import time
+        from config.settings import TUSHARE_TOKEN
+        if not _TS_AVAILABLE or TUSHARE_TOKEN == "your_token_here":
+            logger.warning("tushare 不可用，跳过财务数据")
+            return {}
+
+        # 磁盘缓存：下载一次后持久化，重开命令行直接加载
+        cache_file = os.path.join(self.cache_dir, "_fundamental_cache.parquet")
+        if os.path.exists(cache_file):
+            try:
+                full = pd.read_parquet(cache_file)
+                cache = {}
+                for ts_code, grp in full.groupby('ts_code'):
+                    cache[ts_code] = grp.sort_values('end_date')
+                logger.info(f"财务指标从缓存加载: {len(cache)} 只")
+                return cache
+            except Exception:
+                pass
+
+        pro = ts.pro_api(TUSHARE_TOKEN, timeout=10)
+        s_d = self.start.replace('-', '')[:4] + '0101'
+        e_d = self.end.replace('-', '')
+        cache = {}
+        fields = 'ts_code,end_date,ann_date,roe,grossprofit_margin,netprofit_margin,debt_to_assets'
+        for code in tqdm(codes, desc='下载财务指标'):
+            s = code.zfill(6)
+            ts_code = f"{s}.SH" if s[0] == '6' else f"{s}.SZ"
+            try:
+                df = pro.fina_indicator(ts_code=ts_code, start_date=s_d, end_date=e_d, fields=fields)
+                if df is not None and len(df) > 0:
+                    cache[ts_code] = df
+            except Exception:
+                pass
+            time.sleep(0.55)  # 限速约 100 次/分钟
+
+        # 持久化到磁盘，避免重开命令行后重复下载
+        if cache:
+            try:
+                full = pd.concat(cache.values(), ignore_index=True)
+                full.to_parquet(cache_file, index=False)
+                logger.info(f"财务指标已缓存到磁盘: {cache_file}")
+            except Exception:
+                pass
+
+        logger.info(f"财务指标加载: {len(cache)}/{len(codes)} 只")
+        return cache
+
+    def _load_margin(self):
+        """加载融资融券数据（按日期循环，磁盘缓存），返回 dict{ts_code: DataFrame}"""
+        from config.settings import TUSHARE_TOKEN
+        if not _TS_AVAILABLE or TUSHARE_TOKEN == "your_token_here":
+            logger.warning("tushare 不可用，跳过融资融券数据")
+            return {}
+        cache_file = os.path.join(self.cache_dir, "_margin_cache.parquet")
+        full = None
+        if os.path.exists(cache_file):
+            try:
+                full = pd.read_parquet(cache_file)
+                logger.info(f"融资融券从缓存加载: {len(full)} 行")
+            except Exception:
+                full = None
+        if full is None:
+            pro = ts.pro_api(TUSHARE_TOKEN, timeout=10)
+            cal = pro.trade_cal(exchange='SSE', start_date=self.start.replace('-', ''),
+                                end_date=self.end.replace('-', ''), is_open='1')
+            trade_dates = cal['cal_date'].tolist()
+            frames = []
+            for td in tqdm(trade_dates, desc='下载融资融券'):
+                try:
+                    df = pro.margin_detail(trade_date=td)
+                    if df is not None and len(df) > 0:
+                        frames.append(df[['trade_date', 'ts_code', 'rzye']])
+                except Exception:
+                    pass
+                time.sleep(0.3)
+            if frames:
+                full = pd.concat(frames, ignore_index=True)
+                full.to_parquet(cache_file, index=False)
+                logger.info(f"融资融券已缓存: {cache_file} ({len(full)} 行)")
+        if full is None:
+            return {}
+        margin_dict = {}
+        for ts_code, grp in full.groupby('ts_code'):
+            margin_dict[ts_code] = grp[['trade_date', 'rzye']].sort_values('trade_date')
+        logger.info(f"融资融券加载: {len(margin_dict)} 只")
+        return margin_dict
+
+    def _load_lhb(self):
+        """下载龙虎榜机构净买入（top_inst），返回 dict{ts_code: DataFrame(trade_date, net_buy)}"""
+        from config.settings import TUSHARE_TOKEN
+        if not _TS_AVAILABLE or TUSHARE_TOKEN == "your_token_here":
+            return {}
+        cache_file = os.path.join(self.cache_dir, "_lhb_cache.parquet")
+        full = None
+        if os.path.exists(cache_file):
+            try:
+                full = pd.read_parquet(cache_file)
+                logger.info(f"龙虎榜从缓存加载: {len(full)} 行")
+            except Exception:
+                full = None
+        if full is None:
+            pro = ts.pro_api(TUSHARE_TOKEN, timeout=10)
+            cal = pro.trade_cal(exchange='SSE', start_date=self.start.replace('-', ''),
+                                end_date=self.end.replace('-', ''), is_open='1')
+            trade_dates = cal['cal_date'].tolist()
+            frames = []
+            for td in tqdm(trade_dates, desc='下载龙虎榜'):
+                try:
+                    df = pro.top_inst(trade_date=td)
+                    if df is not None and len(df) > 0:
+                        agg = df.groupby('ts_code')['net_buy'].sum().reset_index()
+                        agg['trade_date'] = td
+                        frames.append(agg)
+                except Exception:
+                    pass
+                time.sleep(0.3)
+            if frames:
+                full = pd.concat(frames, ignore_index=True)
+                full.to_parquet(cache_file, index=False)
+                logger.info(f"龙虎榜已缓存: {len(full)} 行")
+        if full is None:
+            return {}
+        lhb_dict = {}
+        for ts_code, grp in full.groupby('ts_code'):
+            lhb_dict[ts_code] = grp[['trade_date', 'net_buy']].sort_values('trade_date')
+        logger.info(f"龙虎榜加载: {len(lhb_dict)} 只")
+        return lhb_dict
+
+    def _load_block(self):
+        """下载大宗交易金额（block_trade），返回 dict{ts_code: DataFrame(trade_date, amount)}"""
+        from config.settings import TUSHARE_TOKEN
+        if not _TS_AVAILABLE or TUSHARE_TOKEN == "your_token_here":
+            return {}
+        cache_file = os.path.join(self.cache_dir, "_block_cache.parquet")
+        full = None
+        if os.path.exists(cache_file):
+            try:
+                full = pd.read_parquet(cache_file)
+                logger.info(f"大宗交易从缓存加载: {len(full)} 行")
+            except Exception:
+                full = None
+        if full is None:
+            pro = ts.pro_api(TUSHARE_TOKEN, timeout=10)
+            cal = pro.trade_cal(exchange='SSE', start_date=self.start.replace('-', ''),
+                                end_date=self.end.replace('-', ''), is_open='1')
+            trade_dates = cal['cal_date'].tolist()
+            frames = []
+            for td in tqdm(trade_dates, desc='下载大宗交易'):
+                try:
+                    df = pro.block_trade(trade_date=td)
+                    if df is not None and len(df) > 0:
+                        agg = df.groupby('ts_code')['amount'].sum().reset_index()
+                        agg['trade_date'] = td
+                        frames.append(agg)
+                except Exception:
+                    pass
+                time.sleep(0.3)
+            if frames:
+                full = pd.concat(frames, ignore_index=True)
+                full.to_parquet(cache_file, index=False)
+                logger.info(f"大宗交易已缓存: {len(full)} 行")
+        if full is None:
+            return {}
+        block_dict = {}
+        for ts_code, grp in full.groupby('ts_code'):
+            block_dict[ts_code] = grp[['trade_date', 'amount']].sort_values('trade_date')
+        logger.info(f"大宗交易加载: {len(block_dict)} 只")
+        return block_dict
+
     def run_full_download(self, codes=None):
         if codes is None:
             stock_df = self.get_stock_list(exclude_st=True, exclude_north=True)
@@ -379,15 +637,43 @@ class DataDownloader:
         logger.info(f"全量下载: {len(to_download)} 需下载, "
                     f"{self.stats['skipped']} 已缓存 ({self.start} ~ {self.end})")
 
+        # 批量加载财务指标 + 融资融券 + 龙虎榜 + 大宗交易（供 download_and_save merge）
+        if to_download:
+            self.fundamental_cache = self._load_fundamentals(to_download)
+            self.margin_cache = self._load_margin()
+            self.lhb_cache = self._load_lhb()
+            self.block_cache = self._load_block()
+        else:
+            self.margin_cache = {}
+            self.lhb_cache = {}
+            self.block_cache = {}
+
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        N_WORKERS = min(4, max(1, len(to_download) // 1000 + 1))
-        logger.info(f"并行下载: {N_WORKERS} 线程")
+        # 单线程 + 限速：tushare 2000 积分限速约 100 次/分钟，多线程会触发限流
+        N_WORKERS = 1
+        logger.info(f"串行下载: {N_WORKERS} 线程（避免限流）")
         with ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
             futures = {pool.submit(self.download_and_save, code, self.start, self.end): code
                        for code in to_download}
             for f in tqdm(as_completed(futures), total=len(futures), desc="下载"):
                 f.result()
         logger.info("全量下载完成")
+        self._print_latest_date()
+
+    def _print_latest_date(self):
+        """打印缓存数据的最新日期"""
+        files = [f for f in os.listdir(self.cache_dir) if f.endswith('.parquet')]
+        if not files: return
+        dates = []
+        for f in files[:50]:  # 抽样 50 只
+            try:
+                df = pd.read_parquet(os.path.join(self.cache_dir, f))
+                if 'Date' in df.columns:
+                    dates.append(pd.to_datetime(df['Date'].max()))
+            except: pass
+        if dates:
+            latest = max(dates).strftime('%Y-%m-%d')
+            logger.info(f"数据最新日期: {latest}")
 
     def run_incremental_update(self, codes=None, force_rebuild=False):
         """增量更新，force_rebuild=True 时跳过日期检查，全部重建特征"""
@@ -396,16 +682,15 @@ class DataDownloader:
                      for f in os.listdir(self.cache_dir) if f.endswith('.parquet')]
             logger.info(f"扫描到 {len(codes)} 只已缓存股票")
 
-        cutoff = pd.to_datetime(self.end) - pd.Timedelta(days=3)
+        cutoff = pd.to_datetime(self.end)  # 缓存未到今天就更新
         need_update = []
         rebuild_only = []  # 不需下载但需重建特征的
         for code in codes:
             last = self._cache_last_date(code)
+            if force_rebuild:
+                rebuild_only.append(code)
+                continue
             if last is not None and last >= cutoff:
-                if force_rebuild:
-                    rebuild_only.append(code)
-                    continue
-                else:
                     self.stats['skipped'] += 1
                     continue
             next_date = (last + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
@@ -416,10 +701,22 @@ class DataDownloader:
             logger.info("所有股票已是最新")
             return
 
+        # 增量下载截止日：17:00 后用今天（数据已发布），否则昨天
+        now = pd.Timestamp.now()
+        if now.hour >= 17:
+            download_end = pd.to_datetime(self.end).strftime('%Y-%m-%d')
+        else:
+            download_end = (pd.to_datetime(self.end) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+
         for code, from_date in tqdm(need_update, desc="增量更新"):
-            new_df = _ts_download(code, from_date, self.end)
-            if new_df is None:
-                new_df = self._download_raw(code, from_date, self.end)
+            if from_date > download_end:
+                self.stats['skipped'] += 1; continue
+            new_df = _ts_download(code, from_date, download_end)
+            if new_df is not None:
+                new_df.rename(columns=_RENAME_MAP, inplace=True)
+                new_df['Date'] = pd.to_datetime(new_df['Date'])
+            else:
+                new_df = self._download_raw(code, from_date, download_end)
             if new_df is None or new_df.empty:
                 self.stats['failed'] += 1
                 reason = getattr(self, '_last_error', '未知')
@@ -458,45 +755,19 @@ class DataDownloader:
             self.stats['success'] += 1
             time.sleep(0.05)
 
-        # ---- 强制重建：只重建特征不下载 ----
+        # ---- 强制重建 ----
         if rebuild_only:
-            logger.info(f"特征重建: {len(rebuild_only)} 只 (无数据下载)")
-            for code in tqdm(rebuild_only, desc="重建特征"):
-                cache_file = os.path.join(self.cache_dir, f"{code}.parquet")
-                if not os.path.exists(cache_file):
-                    continue
-                df = pd.read_parquet(cache_file)
-                df['Date'] = pd.to_datetime(df['Date'])
-                raw_cols = ['Date'] + _FLOAT_COLS + ['TradeStatus', 'isST']
-                raw_cols = [c for c in raw_cols if c in df.columns]
-                df = df[raw_cols].copy()
-                df = construct_features(df)
-                df = clean_data(df)
-                if not self.validate_data(df, code):
-                    df.to_parquet(cache_file, index=False)
-                    self.stats['success'] += 1
-                else:
-                    self.stats['failed'] += 1
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            logger.info(f"特征重建: {len(rebuild_only)} 只 (4线程)")
 
-        logger.info("增量更新完成")
-
-    # ============================================================
-    #  Report
-    # ============================================================
-
-    def print_report(self):
-        total = sum(v for k, v in self.stats.items() if k in ('success', 'failed', 'skipped'))
-        print("\n" + "=" * 40)
-        print("📊 下载报告")
-        print("=" * 40)
-        print(f"  总计:      {total}")
-        print(f"  成功:      {self.stats['success']}")
-        print(f"  失败:      {self.stats['failed']}")
-        print(f"  跳过:      {self.stats['skipped']}")
-        print(f"  校验通过:  {self.stats['validated_ok']}")
-        print(f"  校验警告:  {self.stats['validated_warn']}")
-        if self.errors:
-            print(f"\n  失败 ({len(self.errors)}):")
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                tasks = [(self.cache_dir, c, self.start, self.end) for c in rebuild_only]
+                futures = {pool.submit(_rebuild_one_stock, t): t[1] for t in tasks}
+                for f in tqdm(as_completed(futures), total=len(futures), desc="重建特征"):
+                    code, ok = f.result()
+                    if ok is True: self.stats['success'] += 1
+                    elif ok == 'skip': self.stats['skipped'] += 1
+                    else: self.stats['failed'] += 1
             for code, reason in self.errors[:10]:
                 print(f"    {code}: {reason}")
         print("=" * 40)

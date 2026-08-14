@@ -1,80 +1,128 @@
-# DualAlpha — A股双阶段量化交易系统
+# DualAlpha —— A股多因子量化选股系统
 
-**选股（树模型集成） + 择时（iTransformer） → 模拟盘全自动交易**
-
-## 架构
-
-```
-tushare 日线 (2015-2026, 5000+ 只)
-  │
-  ├→ 58 维因子计算（量价 + 基本面 + 北向 + 股东行为）
-  │
-  ├→ TreeEnsemble (XGBoost + LightGBM + CatBoost)
-  │     └→ 截面排序 → Top-N 股票池
-  │
-  └→ iTransformer (58 特征 × 90 天)
-        └→ 两阶段训练（分类优先 → 回归微调）
-              └→ up_prob 择时信号
-                    │
-                    └→ 风险平价 + 市场自适应 → 最终仓位
-```
+一个基于**树模型集成 + 多源另类数据**的 A 股量化选股系统。核心是"截面选股"：每月从全市场选出 20 只股票等权持有，配合止损控制尾部风险。
 
 ## 核心特性
 
-- **58 维因子**：量价（33）、基本面（6）、北向资金（3）、股东行为（2）、周期编码（6）、交叉特征（2） + 衍生
-- **两阶段训练**：阶段 1 冻结回归头直训分类 → acc≥75% 解冻回归头微调
-- **市场自适应**：牛市低门槛 + 满仓、熊市高门槛 + 半仓
-- **风险平价**：协方差矩阵 + 置信度加权 → 每只股票权重
-- **8 窗口滚动回测**：2019-2026，逐窗口验证模型衰减周期
-- **T+1 模拟盘**：交易费率、涨跌停、行业集中度限制，全自动日志
+- **多源另类数据因子**：财务指标（ROE/毛利率/净利率/负债率）+ 融资融券 + 龙虎榜机构净买入 + 大宗交易 + 动量 + Alpha158 技术因子，共 55 个特征
+- **分位数回归选股器**：LightGBM 分位数回归输出 P50（期望收益）/ P10（下行风险）/ P90（上行潜力），XGBoost/LightGBM/CatBoost 三模型 IC 加权融合
+- **P10 下行风控 + 行业中性化**：排除下行风险大的股票，每行业仅选 1 只，天然分散
+- **截断亏损、让利润奔跑**：持有期跌超 10% 止损，上涨不设顶（靠月度调仓自然止盈）
+- **滚动窗口交叉验证**：8 个年度窗口（2019-2026）样本外验证，避免过拟合
 
-## 快速开始
+## 最终策略配置
 
-```bash
-# 1. 安装依赖
-pip install tushare torch lightgbm xgboost catboost pandas numpy scikit-learn joblib
-
-# 2. 配置 token（config/local_settings.py）
-TUSHARE_TOKEN = "你的token"
-
-# 3. 下载数据
-python scripts/download_data.py --full --start 2015-01-01
-
-# 4. 训练模型
-python scripts/train_final_model.py       # 时序（~8h GPU）
-python scripts/train_selector.py           # 选股（~2min）
-
-# 5. 每日盘后
-python scripts/download_data.py             # 增量更新
-python scripts/daily_select.py              # 选股
-python scripts/daily_predict.py             # 择时打分
-
-# 6. 次日盘中
-python scripts/sim_live.py                  # 模拟监控
+```
+选股器：LightGBM 分位数回归 + XGBoost/LightGBM/CatBoost IC加权融合（55特征）
+标签：  未来 20 天收益
+选股：  P10风控(排除P10<-15%) + 行业中性化(每行业1只) + Top20
+持有：  等权月度再平衡 + 止损10%（只止损不止盈）
 ```
 
-## 回测结果（中低频策略，8 窗口滚动）
+## 回测结果（8窗口滚动验证，2019-2026）
 
-| 窗口 | 测试年份 | 收益率 | 交易笔数 | 市场环境 |
-|------|---------|--------|---------|---------|
-| W1   | 2019    | -3.55% | 17      | 牛市（训熊测牛） |
-| W2   | 2020    | +1.19% | 29      | 大幅波动 |
-| W3   | 2021    | -0.75% | 11      | 横盘震荡 |
-| W4   | 2022    | -5.10% | 33      | 大熊市（跑赢指数 16%） |
-| W5   | 2023    | -10.35% | 51     | 风格切换，模型失效 |
-| W6   | 2024    | -12.84% | 53     | 政策冲击，最差窗口 |
-| W7   | 2025    | -3.59% | 32      | 回升中 |
-| W8   | 2026    | -1.10% | 18      | 趋近收敛 |
+| 窗口 | 年份 | 市场环境 | 总收益 | 最大回撤 | 夏普 |
+| :--: | :--: | :--: | :--: | :--: | :--: |
+| 1 | 2019 | 普涨 | +99.44% | -5.88% | 1.930 |
+| 2 | 2020 | 疫情波动 | +46.20% | -6.97% | 1.809 |
+| 3 | 2021 | 结构牛 | +63.88% | -6.27% | 2.381 |
+| 4 | 2022 | 大熊市 | +22.91% | -8.97% | 0.965 |
+| 5 | 2023 | 震荡 | +29.82% | -9.89% | 1.305 |
+| 6 | 2024 | 政策牛 | +37.17% | -10.06% | 0.983 |
+| 7 | 2025 | 稳健上行 | +50.35% | -7.08% | 2.729 |
+| 8 | 2026(至8月) | 分化 | +18.07% | -6.95% | 1.127 |
 
-模型对市场结构变化的适应窗口约 2-3 年，建议每 6 个月重训。
+**核心指标**：平均夏普 **1.654**，7.5 年复合收益 **18.57 倍**（年化约 44%）。
+
+**关键亮点**：2022 年大熊市和 2026 年科技暴跌中依然正收益——龙虎榜/大宗交易因子识别"资金护盘"，止损截断尾部风险。
 
 ## 技术栈
 
-`Python` `PyTorch` `LightGBM` `XGBoost` `CatBoost` `Pandas` `NumPy` `Tushare`
+| 类别 | 技术 |
+| :--: | :--: |
+| 选股模型 | LightGBM / XGBoost / CatBoost（分位数回归 + IC加权融合）|
+| 择时模型 | PyTorch iTransformer（RevIN + 注意力池化，双头回归/分类）|
+| 数据源 | Tushare（复权数据 + 另类数据 API）|
+| 数据处理 | Pandas / NumPy / Scikit-learn / scipy |
+| 模型持久化 | joblib / torch |
+| 回测引擎 | 自定义滚动窗口回测（含佣金/印花税/止损/停牌剔除）|
+
+## 项目结构
+
+```text
+.
+├── config/settings.py           # 全局配置（FEATURE_COLS、阈值、路径）
+├── core/
+│   ├── data_downloader.py       # Tushare 数据下载 + 复权 + 另类数据缓存
+│   ├── features.py              # 特征构造（技术指标 + Alpha158 + 另类数据）
+│   ├── stock_selector.py        # 树模型选股器（分位数回归 + IC加权融合）
+│   ├── model.py                 # iTransformer 择时模型
+│   ├── trainer.py               # 择时模型训练（AMP + 两阶段）
+│   ├── backtest_engine.py       # 两阶段回测引擎
+│   └── ...
+├── research/                    # 因子研究实验室（独立于 core）
+│   ├── factor_lab.py            # 因子 IC 审计 / 滚动窗口分析
+│   └── alpha101.py              # WorldQuant Alpha101 因子库
+├── scripts/
+│   ├── download_data.py         # 数据下载（--full / --incremental / --force）
+│   ├── train_selector.py        # 训练选股器
+│   ├── pure_selection_backtest.py # 纯选股对照回测（8窗口）
+│   ├── daily_select.py          # 盘后选股
+│   ├── daily_predict.py         # 盘前择时推断
+│   └── sim_live.py              # 实盘模拟（心跳 + 微信推送）
+└── output/                      # 模型与结果统一输出目录
+```
+
+## 运行流程
+
+### 1. 数据下载 + 特征重建
+
+```bash
+python scripts/download_data.py --full        # 全量下载（tushare）
+python scripts/rebuild_financial_features.py  # 重建财务/融资融券/龙虎榜/大宗交易因子
+```
+
+### 2. 因子筛选（可选）
+
+```bash
+python research/factor_lab.py --stocks 100 --forward 20
+```
+
+### 3. 训练选股器 + 回测验证
+
+```bash
+python scripts/train_selector.py              # 训练最终选股器 → output/selector_ensemble.pkl
+python scripts/pure_selection_backtest.py     # 8窗口滚动回测
+```
+
+### 4. 每日实盘流程
+
+```bash
+python scripts/daily_select.py   # 盘后选股（P10风控 + 行业中性化 + Top20）
+python scripts/daily_predict.py  # 盘前择时推断
+python scripts/sim_live.py       # 实盘模拟（挂后台，每分钟心跳）
+```
+
+## 回测优化结论（重要）
+
+本项目在 8 窗口样本外回测中系统性验证了多个优化方向：
+
+| 有效（正贡献）| 无效（负优化/无差）|
+| :--: | :--: |
+| 龙虎榜/大宗交易因子（夏普 1.295→1.555）| 行业轮动、最小方差、趋势仓位 |
+| 止损10%（夏普 1.555→1.654）| 堆叠集成(MLP+Ridge)、行业排名标签 |
+| 前视偏差修复（财务ann_date/停牌股）| 双周调仓、止盈、持仓数量、时间衰减180天 |
+
+**核心洞察**：多源数据因子 + 简单等权 + 止损，优于任何"更聪明"的策略/模型叠加——简单就是最好。
 
 ## 免责声明
 
-本项目仅供研究和学习使用，不构成任何投资建议。历史回测收益不代表未来表现。
+**⚠️ 本项目仅供量化研究与学习使用，不构成任何投资建议。实盘交易需谨慎，风险自负。**
 
-⚠ 本策略 2023-2024 年出现连续亏损（-10%/-13%），尚未实盘验证。
-不建议实盘跟单，仅供研究交流。
+## 交流
+
+暂冻代码备考，后续更新一个月实盘模拟，如果有任何交流，请邮件acsorceress@gmail.com
+
+## License
+
+This project is licensed under the Apache License, Version 2.0 - see the [LICENSE](LICENSE) file for details.

@@ -28,11 +28,11 @@ def parse_args():
                         help='用于训练的股票数量（默认6000）')
     parser.add_argument('--end-date', type=str, default=TODAY,
                         help=f'训练截止日期，格式 YYYY-MM-DD（默认 {TODAY}）')
-    parser.add_argument('--model-path', type=str, default="model_final.pth",
+    parser.add_argument('--model-path', type=str, default=os.path.join(OUTPUT_DIR, "model_final.pth"),
                         help='模型保存路径（默认 model_final.pth）')
-    parser.add_argument('--scaler-x', type=str, default="scaler_X_final.pkl",
+    parser.add_argument('--scaler-x', type=str, default=os.path.join(OUTPUT_DIR, "scaler_X_final.pkl"),
                         help='X标准化器保存路径')
-    parser.add_argument('--scaler-y', type=str, default="scaler_Y_final.pkl",
+    parser.add_argument('--scaler-y', type=str, default=os.path.join(OUTPUT_DIR, "scaler_Y_final.pkl"),
                         help='Y标准化器保存路径')
     parser.add_argument('--min-days', type=int, default=200,
                         help='股票最少数据天数（默认200）')

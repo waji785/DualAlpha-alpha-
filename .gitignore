@@ -36,6 +36,9 @@ Thumbs.db
 # ====================
 stock_data_cache/
 *.parquet
+
+# 个人配置
+config/local_settings.py
 *.csv
 
 # ====================

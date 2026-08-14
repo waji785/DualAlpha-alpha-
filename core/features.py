@@ -91,10 +91,14 @@ def construct_features(df):
     df = df.copy()
     close, high, low, volume = df['Close'], df['High'], df['Low'], df['Volume']
 
-    # ========== ① 动量 / 收益率（3 个）==========
-    df['Momentum_5'] = close.pct_change(5)
-    df['Momentum_10'] = close.pct_change(10)
+    # ========== ① 动量 / 收益率 ==========
+    # 短期反转（A股短期：涨多回调 → 取负使"跌多"给高分）
+    df['Momentum_5'] = -close.pct_change(5)
+    df['Momentum_10'] = -close.pct_change(10)
     df['Return_1d'] = close.pct_change()
+    # 中期/长期动量（A股中期：强者恒强 → 保持正）
+    df['Momentum_120'] = close.pct_change(120)
+    df['Momentum_250'] = close.pct_change(250)
 
     # ========== ② 波动率（2 个）==========
     df['Volatility_5'] = df['Return_1d'].rolling(5).std()
@@ -224,7 +228,69 @@ def construct_features(df):
     df['Quarter_cos'] = np.cos(2 * np.pi * quarter / 4)
 
     # ================================================================
-    #  另类数据衍生特征（从 tushare 额外数据列自动计算）
+    #  Alpha101 因子（IC 验证通过后集成）
+    # ================================================================
+    # 内联实现，避免触发 alpha101.py 中未完成的 ALL_ALPHAS
+    _a032_r = df['Close'].pct_change() * df['Volume']
+    df['Alpha032'] = (_a032_r.rolling(5).sum() / df['Volume'].rolling(20).mean()).fillna(0)
+    df['Alpha041'] = ((((df['High']+df['Low']+df['Close'])/3*df['Volume']).rolling(20).sum()/
+                        df['Volume'].rolling(20).sum() - df['Close']).rolling(5).max()).rank(pct=True)**2
+    df['Alpha002'] = -pd.Series(np.log(df['Volume']+1).diff(2).rank(pct=True)).rolling(6).corr(
+        pd.Series(((df['Close']-df['Open'])/df['Open']).rank(pct=True))).fillna(0)
+    df['Alpha013'] = -df['Close'].rank(pct=True).rolling(5).cov(df['Volume'].rank(pct=True)).rank(pct=True).fillna(0)
+    df['Alpha015'] = -(df['High'].rank(pct=True).rolling(3).corr(
+        df['Volume'].rank(pct=True)).rank(pct=True)).rolling(3).sum().fillna(0)
+    df['Alpha012'] = (np.sign(df['Volume'].diff(1)) * (-df['Close'].diff(1))).fillna(0)
+    df['Alpha020'] = (-(df['Open']-df['High'].shift(1)).rank(pct=True) *
+                       (df['Open']-df['Close'].shift(1)).rank(pct=True) *
+                       (df['Open']-df['Low'].shift(1)).rank(pct=True)).fillna(0)
+    # IC≥0.25 新因子
+    df['Alpha049'] = -(df['Close'].diff(1).rolling(20).sum().rank(pct=True) *
+                       (df['Close'] / df['Close'].rolling(20).mean()).rank(pct=True)).fillna(0)
+    df['Alpha005'] = ((df['Open']-((df['High']+df['Low']+df['Close'])/3*df['Volume']).rolling(10).sum()/
+                       df['Volume'].rolling(10).sum()/10).rank(pct=True) *
+                      (-abs((df['Close']-((df['High']+df['Low']+df['Close'])/3*df['Volume']).rolling(10).sum()/
+                             df['Volume'].rolling(10).sum()).rank(pct=True)))).fillna(0)
+    df['Alpha092'] = -(df['Open']-df['Close']).rolling(30).sum().rank(pct=True) * \
+                      (df['Open']-df['Close']).rolling(10).sum().rank(pct=True).fillna(0)
+    df['Alpha083'] = -((df['High']-df['Low'])/df['Close']).rank(pct=True) * \
+                      df['Close'].pct_change().rolling(10).sum().rank(pct=True).fillna(0)
+    df['Alpha098'] = -(df['Open']-df['Close']).rolling(10).sum().rank(pct=True) * \
+                      df['Open'].pct_change().rolling(10).std().rank(pct=True).fillna(0)
+    # IC>0.32 新 Alpha
+    df['Alpha043'] = -(df['Close'].rank(pct=True).apply(lambda x:1/x).diff(1).rolling(20).sum().rank(pct=True) / df['High'].rolling(20).sum().rank(pct=True)).fillna(0)
+    df['Alpha079'] = -(df['Close'].pct_change().rolling(20).sum().rank(pct=True) * df['Close'].pct_change().rolling(10).sum().rank(pct=True) * df['Close'].rolling(20).corr(df['Volume'].rolling(20).mean()).rank(pct=True)).fillna(0)
+    df['Alpha082'] = -(df['Close'].pct_change().rolling(10).sum().rank(pct=True) * df['Volume'].rolling(10).sum().rank(pct=True)).fillna(0)
+    df['Alpha080'] = -(df['Close'].pct_change()*df['Volume']/df['Volume'].rolling(5).mean()).rolling(5).sum().rank(pct=True).fillna(0)
+    df['Alpha090'] = -((df['Open']-df['Close']).rolling(10).sum()*df['Open'].rank(pct=True).rolling(10).corr(df['Close'].rank(pct=True))).rank(pct=True).fillna(0)
+    df['Alpha087'] = -((df['Open']-df['High'].shift(5)).rank(pct=True) * df['Close'].pct_change(5).rolling(10).sum().rank(pct=True)).fillna(0)
+    df['Alpha064'] = -(df['Close'].pct_change().rolling(10).sum().rank(pct=True) * df['Close'].rolling(10).corr(df['Volume']).rank(pct=True)).fillna(0)
+    df['Alpha100'] = -(df['Close'].pct_change().rolling(20).sum().rank(pct=True) * df['Close'].rolling(10).corr(df['Volume']).rank(pct=True)).fillna(0)
+    df['Alpha063'] = -(df['Close'].pct_change().rolling(20).sum().rank(pct=True) * df['Close'].pct_change().rolling(20).std().rank(pct=True)).fillna(0)
+    df['Alpha059'] = -(df['Close']/df['Close'].rolling(10).mean()).rolling(10).sum().rank(pct=True) * (df['Close']/df['Close'].rolling(20).mean()).rolling(10).sum().rank(pct=True).fillna(0)
+    # ↑增强因子 (近期IC>0.06)
+    df['Alpha048'] = -(np.sign(df['Close'].diff(1)+df['Close'].diff(-1))).rank(pct=True).fillna(0)
+    df['Alpha024'] = (df['Close'].pct_change().rolling(5).sum().rank(pct=True) - df['Close'].pct_change().rolling(20).mean().rank(pct=True)).fillna(0)
+    df['Alpha086'] = -((df['High']-df['Low'])/df['Close']).rank(pct=True) * df['Close'].pct_change().rolling(20).sum().rank(pct=True).fillna(0)
+    df['Alpha073'] = -(df['Open'].diff(10).rolling(10).apply(lambda x: (x*np.arange(1,11)/55).sum()).rank(pct=True) * df['Close'].rolling(10).corr(df['Volume'].rolling(10).mean()).rolling(3).apply(lambda x: (x*np.arange(1,4)/6).sum()).rank(pct=True)).fillna(0)
+    df['Alpha078'] = -(df['Close'].pct_change().rolling(5).sum().rank(pct=True) * (df['Volume']/df['Volume'].rolling(5).mean()).rank(pct=True)).fillna(0)
+    df['Alpha065'] = -(df['Low'].pct_change().rolling(10).sum().rank(pct=True) * df['Low'].rolling(10).corr(df['Volume'].rolling(10).mean()).rank(pct=True)).fillna(0)
+    df['Alpha088'] = -((df['Open']-df['Close']).rolling(10).sum().rank(pct=True) * df['Open'].rolling(10).corr(df['Close']).rank(pct=True)).fillna(0)
+    df['Alpha031'] = (df['Close'].diff(10).rolling(10).apply(lambda x: (x*np.arange(1,11)/55).sum()).rank(pct=True) + (-df['Close'].diff(3).rank(pct=True))*np.sign(df['Close'].rolling(12).corr(df['Volume'].rolling(15).mean()))).fillna(0)
+
+    # Alpha158 新因子
+    df['KMID'] = (df['High'] + df['Low']) / 2
+    df['LLV'] = df['Close'] / df['Low'].expanding().min() - 1
+    df['HHV'] = df['Close'] / df['High'].expanding().max() - 1
+    obv = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
+    df['OBV'] = obv
+    vwap20 = ((df['High']+df['Low']+df['Close'])/3 * df['Volume']).rolling(20).sum() / df['Volume'].rolling(20).sum()
+    df['VWAP_GAP'] = df['Close'] / vwap20 - 1
+    clv = ((df['Close']-df['Low'])-(df['High']-df['Close'])) / (df['High']-df['Low']+1e-8)
+    df['AD'] = (clv * df['Volume']).cumsum()
+
+    # ================================================================
+    #  另类数据衍生特征
     # ================================================================
     if 'North_Hold' in df.columns:
         df['North_Hold_Chg_5d'] = df['North_Hold'].diff(5)

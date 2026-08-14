@@ -28,10 +28,10 @@ SCALER_Y_PATH = os.path.join(BASE_DIR, "scaler_y.pkl")
 WHITELIST_FILE = os.path.join(BASE_DIR, "whitelist.csv")
 WHITELIST_EXTENDED_FILE = os.path.join(BASE_DIR, "whitelist_extended.csv")
 
-# ------------------- 特征列（59 个） -------------------
+# ------------------- 特征列（70 个） -------------------
 FEATURE_COLS = [
-    # 动量 / 收益率（3）
-    'Momentum_5', 'Momentum_10', 'Return_1d',
+    # 动量 / 收益率（4：短期反转 + 中期动量）
+    'Momentum_5', 'Momentum_10', 'Momentum_120', 'Momentum_250',
     # 波动率（2）
     'Volatility_5', 'Volatility_10',
     # 均线 & 偏离（6）
@@ -40,12 +40,18 @@ FEATURE_COLS = [
     'MA_5_20_diff',
     # 超买超卖（2）
     'RSI_14', 'BB_position',
-    # 量价关系（3）
-    'Volume_Ratio', 'High_Low_Ratio', 'Amount_Ratio',
-    # 原始字段标准化（5）
-    'Close', 'Volume', 'PctChg', 'TradeStatus', 'Turnover',
+    # 量价关系（2）
+    'High_Low_Ratio', 'Amount_Ratio',
+    # 原始字段标准化（4）
+    'Close', 'Volume', 'Turnover',
     # 估值（4）— 由 data_loader.enrich_fundamentals 获取真实数据
-    'PeTTM', 'PbMRQ', 'PsTTM', 'PcfNcfTTM',
+    'PeTTM', 'PbMRQ', 'PsTTM',
+    # 财务基本面（4）— 由 fina_indicator 批量下载（quarter→daily）
+    'ROE', 'GrossMargin', 'NetMargin', 'DebtRatio',
+    # 融资融券（2）— 由 margin_detail 批量下载（融资余额变化率）
+    'Margin_Chg_5d', 'Margin_Chg_20d',
+    # 龙虎榜/大宗交易（2）— 事件数据（20天累计）
+    'LHB_Net_Buy_20d', 'Block_Amount_20d',
     # MACD（3）
     'MACD_DIF', 'MACD_DEA', 'MACD_HIST',
     # KDJ（3）
@@ -54,31 +60,23 @@ FEATURE_COLS = [
     'ATR_14', 'ATRP',
     # OBV 斜率（1）
     'OBV_slope',
-    # 连涨连跌（2）
-    'Consecutive_Up', 'Consecutive_Down',
+    # 连涨连跌（1）
+    'Consecutive_Up',
     # 价格分位（1）
     'Price_Position_20',
-    # K 线影线（2）
-    'Upper_Shadow', 'Lower_Shadow',
-    # 量能加速度（1）
-    'Volume_Accel',
+    # K 线影线（1）
+    'Lower_Shadow',
     # 资金流量（1）
     'MFI_14',
     # 🆕 周期特征（6）— sin/cos 编码
-    'Dow_sin', 'Dow_cos',          # 星期几
     'Month_sin', 'Month_cos',      # 月份
     'Quarter_sin', 'Quarter_cos',  # 季度
     # 交叉特征（2）
     'Mom_Vol', 'RSI_Vol',
     # 🆕 另类数据特征（6）— tushare 接口，缺失则填充 0
-    'North_Hold',                   # 北向持仓比例
-    'ROE', 'GrossMargin',           # 基本面质量
-    'NetMargin', 'DebtRatio',
-    'Insider_Signal',               # 股东增减持信号（-1/0/+1）
     # 🆕 衍生特征（3）— 自动计算
-    'North_Hold_Chg_5d',            # 北向 5 日变化
-    'North_Hold_Chg_20d',           # 北向 20 日变化
-    'Insider_Buy_Window',           # 股东 60 日净买入
+    # Alpha158 因子（6，无前视：expanding/rolling/cumsum 均只用历史）
+    'KMID', 'LLV', 'HHV', 'OBV', 'VWAP_GAP', 'AD',
 ]
 
 INPUT_DIM = len(FEATURE_COLS)   # 自动跟随特征数变化（当前 58）
@@ -124,7 +122,7 @@ EPOCHS = 100
 GRAD_ACCUM_STEPS = 2
 
 # ---- 数据 ----
-MAX_SAMPLES_PER_EPOCH = 200000
+MAX_SAMPLES_PER_EPOCH = 150000  # 72dim×90seq≈3.9GB，32G内存安全
 EPOCHS = 100
 PATIENCE = 25
 REGRESSION_WEIGHT = 0.1
@@ -151,7 +149,7 @@ NUM_HORIZONS = 3            # 同时预测的周期数
 HORIZON_DAYS = [5, 10, 20]  # 预测天数
 
 # ------------------- 回测参数 -------------------
-BUY_THRESHOLD = 0.38    # 降低门槛（多周期模型输出更保守）
+BUY_THRESHOLD = 0.35    # 放宽以增加信号
 SELL_THRESHOLD = 0.42
 STOP_LOSS = -0.08
 TAKE_PROFIT = 0.20
@@ -179,7 +177,7 @@ STAMP_DUTY_RATE = 0.001          # 印花税率（仅卖出，千1）
 SLIPPAGE = 0.001                 # 滑点（买卖各0.1%）
 
 # ------------------- 扩展窗口交叉验证参数 -------------------
-TRAIN_START_DATE = "2018-01-01"        # 训练起始日期（固定）
+TRAIN_START_DATE = "2015-01-01"        # 训练起始日期（固定）
 WINDOW_LENGTH_YEARS = 3                # 每个窗口的训练集长度（年）
 TEST_LENGTH_YEARS = 1                  # 每个窗口的测试集长度（年）
 NUM_WINDOWS = 1                        # 窗口数量（最多不超过数据总长度）

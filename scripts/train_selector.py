@@ -80,9 +80,9 @@ def train_selector(output_path="selector_ensemble.pkl",
 
     # 7. 保存
     ensemble.save(output_path)
-    logger.info(f"✅ 选股模型保存: {output_path}")
+    logger.info(f"选股模型保存: {output_path}")
     return ensemble
 
 
 if __name__ == "__main__":
-    train_selector()
+    train_selector(os.path.join(OUTPUT_DIR, "selector_ensemble.pkl"))

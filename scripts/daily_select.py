@@ -129,9 +129,9 @@ def daily_select(selector_path="selector_ensemble.pkl",
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--selector", default="selector_ensemble.pkl")
+    p.add_argument("--selector", default=os.path.join(OUTPUT_DIR, "selector_ensemble.pkl"))
     p.add_argument("--model", default=os.path.join(OUTPUT_DIR, "model_final.pth"))
     p.add_argument("--top", type=int, default=20)
-    p.add_argument("--output", default="daily_picks.csv")
+    p.add_argument("--output", default=os.path.join(OUTPUT_DIR, "daily_picks.csv"))
     args = p.parse_args()
     daily_select(args.selector, args.model, args.top, args.output)

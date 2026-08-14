@@ -236,6 +236,15 @@ def main():
         logger.info(f"窗口 {i+1}: 总收益={total_ret*100:+.2f}% 年化={ann*100:.2f}% "
                     f"回撤={dd*100:.2f}% 夏普={sharpe:.3f} "
                     f"选股={selects} 交易={trades}")
+
+        # 分析层
+        try:
+            from core.backtest_analyzer import analyze_backtest
+            bm_df = load_from_cache('000300')
+            analyze_backtest(cap_df, None, bm_df, title=f"窗口 {i+1} ({test_start[:7]}~{test_end[:7]})")
+        except Exception as e:
+            logger.warning(f"分析层跳过: {e}")
+
         all_results.append({
             'window': i+1, 'train_end': train_end, 'test': f"{test_start}~{test_end}",
             'total_return': total_ret, 'annual_return': ann,

@@ -65,9 +65,24 @@ def get_stock_list(exclude_st=True, exclude_north=True):
     """
     # 优先本地缓存
     if os.path.exists(CACHE_DIR):
-        cache_files = [f.replace('.parquet', '') for f in os.listdir(CACHE_DIR) if f.endswith('.parquet')]
+        cache_files = [f.replace('.parquet', '') for f in os.listdir(CACHE_DIR)
+                       if f.endswith('.parquet') and not f.startswith('_')]
         if len(cache_files) > 100:
             df = pd.DataFrame({'code': cache_files, 'name': cache_files})
+            # 尝试从 tushare 获取真实名称（失败则保留 code）
+            try:
+                from config.settings import TUSHARE_TOKEN
+                import tushare as ts
+                if TUSHARE_TOKEN != "your_token_here":
+                    pro = ts.pro_api(TUSHARE_TOKEN)
+                    stocks = pro.stock_basic(exchange='', list_status='L',
+                                             fields='symbol,name')
+                    if stocks is not None and len(stocks) > 0:
+                        stocks['code'] = stocks['symbol'].str.zfill(6)
+                        name_map = dict(zip(stocks['code'], stocks['name'].fillna('')))
+                        df['name'] = df['code'].map(name_map).fillna(df['code'])
+            except Exception:
+                pass
             logger.info(f"股票列表从缓存: {len(df)} 只")
             return df
 
@@ -104,7 +119,7 @@ def get_stock_list(exclude_st=True, exclude_north=True):
         if len(df) < 1000:
             logger.warning(f"baostock 仅返回 {len(df)} 只（疑似断连），从缓存扫描...")
             cache_codes = [f.replace('.parquet', '')
-                          for f in os.listdir(CACHE_DIR) if f.endswith('.parquet')]
+                          for f in os.listdir(CACHE_DIR) if f.endswith('.parquet') and not f.startswith('_')]
             if len(cache_codes) > len(df):
                 df = pd.DataFrame({'code': cache_codes, 'name': ''})
             logger.info(f"缓存目录: {len(df)} 只")

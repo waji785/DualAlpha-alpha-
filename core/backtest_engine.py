@@ -290,8 +290,8 @@ def get_signal_for_day(df, model_path, seq_len, buy_threshold):
     ckpt = torch.load(model_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt.state_dict(), strict=False)
     model.eval()
-    sX = joblib.load('scaler_X_final.pkl')
-    sY = joblib.load('scaler_Y_final.pkl')
+    sX = joblib.load(os.path.join(OUTPUT_DIR, 'scaler_X_final.pkl'))
+    sY = joblib.load(os.path.join(OUTPUT_DIR, 'scaler_Y_final.pkl'))
 
     close = df['Close'].values[-seq_len-50:].astype(np.float32)
     feat_raw = df[FEATURE_COLS].values[-seq_len-50:].astype(np.float32)
