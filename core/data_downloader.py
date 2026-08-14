@@ -440,7 +440,8 @@ class DataDownloader:
             df = pd.read_parquet(cache_file, columns=['Date'])
             if df.empty:
                 return None
-            return pd.to_datetime(df['Date'].max())
+            last = pd.to_datetime(df['Date'].max())
+            return None if pd.isna(last) else last
         except Exception:
             return None
 
@@ -690,10 +691,13 @@ class DataDownloader:
             if force_rebuild:
                 rebuild_only.append(code)
                 continue
-            if last is not None and last >= cutoff:
-                    self.stats['skipped'] += 1
-                    continue
-            next_date = (last + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+            if last is not None and not pd.isna(last) and last >= cutoff:
+                self.stats['skipped'] += 1
+                continue
+            if last is None or pd.isna(last):
+                next_date = self.start
+            else:
+                next_date = (last + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
             need_update.append((code, next_date))
 
         logger.info(f"需更新: {len(need_update)}, 重建: {len(rebuild_only)}")
