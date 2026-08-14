@@ -67,9 +67,9 @@
 │   ├── download_data.py         # 数据下载（--full / --incremental / --force）
 │   ├── train_selector.py        # 训练选股器
 │   ├── pure_selection_backtest.py # 纯选股对照回测（8窗口）
-│   ├── daily_select.py          # 盘后选股
-│   ├── daily_predict.py         # 盘前择时推断
-│   └── sim_live.py              # 实盘模拟（心跳 + 微信推送）
+│   ├── daily_select.py          # 盘后选股（选股器打分）
+│   ├── daily_predict.py         # 盘前择时推断（可选，事件驱动那套）
+│   └── monthly_live.py          # 月度实盘（跨月调仓 + 持有期止损，复现回测逻辑）
 └── output/                      # 模型与结果统一输出目录
 ```
 
@@ -95,13 +95,18 @@ python scripts/train_selector.py              # 训练最终选股器 → output
 python scripts/pure_selection_backtest.py     # 8窗口滚动回测
 ```
 
-### 4. 每日实盘流程
+### 4. 每日实盘流程（月度调仓，复现回测逻辑）
 
 ```bash
-python scripts/daily_select.py   # 盘后选股（P10风控 + 行业中性化 + Top20）
-python scripts/daily_predict.py  # 盘前择时推断
-python scripts/sim_live.py       # 实盘模拟（挂后台，每分钟心跳）
+python scripts/download_data.py --incremental  # 每日增量更新数据（盘后）
+python scripts/monthly_live.py                 # 月度实盘：跨月自动调仓 + 持有期止损
 ```
+
+`monthly_live.py` 每天运行一次，自动判断：
+- **跨月** → 调仓：卖出旧持仓 → 选股(P10风控+每行业1只+Top20) → 等权买入
+- **持有期** → 检查止损：持仓跌超 10% 自动卖出
+
+状态持久化到 `output/monthly_state.json`，交易流水写入 `output/monthly_trade_log.csv`（即"真实信号 vs 实际走势"的记录来源）。
 
 ## 回测优化结论（重要）
 
@@ -115,13 +120,13 @@ python scripts/sim_live.py       # 实盘模拟（挂后台，每分钟心跳）
 
 **核心洞察**：多源数据因子 + 简单等权 + 止损，优于任何"更聪明"的策略/模型叠加——简单就是最好。
 
+## 交流
+
+暂冻代码备考，后续更新实盘模拟，如果有任何交流，请邮件acsorceress@gmail.com
+
 ## 免责声明
 
 **⚠️ 本项目仅供量化研究与学习使用，不构成任何投资建议。实盘交易需谨慎，风险自负。**
-
-## 交流
-
-暂冻代码备考，后续更新一个月实盘模拟，如果有任何交流，请邮件acsorceress@gmail.com
 
 ## License
 
