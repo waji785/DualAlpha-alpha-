@@ -88,7 +88,12 @@ def get_realtime_price(code, trade_date):
 
 
 def get_price(code, today):
-    """获取某股票截至 today 的最新收盘价（缓存优先，tushare 实时补今天）"""
+    """获取某股票实际交易收盘价（tushare 实时，不复权；缓存后复权仅作降级）"""
+    # 优先 tushare 实时（实际价格，不复权，与真实交易一致）
+    px = get_realtime_price(code, today)
+    if px is not None:
+        return px
+    # 降级：缓存（后复权价，与真实价格有复权偏差，仅 tushare 失败时用）
     df = load_from_cache(code)
     if df is None or len(df) == 0:
         return None
@@ -96,15 +101,6 @@ def get_price(code, today):
     row = df[df['Date'] <= today]
     if len(row) == 0:
         return None
-    cache_last = row['Date'].iloc[-1]
-    # 缓存已更新到今天 → 用缓存
-    if cache_last.normalize() == today.normalize():
-        return float(row['Close'].iloc[-1])
-    # 缓存滞后 → 用 tushare 实时查今天收盘价
-    px = get_realtime_price(code, today)
-    if px is not None:
-        return px
-    # fallback：缓存最新收盘价
     return float(row['Close'].iloc[-1])
 
 
