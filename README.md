@@ -98,8 +98,9 @@ python scripts/pure_selection_backtest.py     # 8窗口滚动回测
 ### 4. 每日实盘流程（月度调仓，复现回测逻辑）
 
 ```bash
-python scripts/download_data.py --incremental  # 每日增量更新数据（盘后）
-python scripts/monthly_live.py                 # 月度实盘：跨月自动调仓 + 持有期止损
+python scripts/download_data.py   # 每月最后一天增量更新数据（盘后）
+python scripts/train_selector.py		#重训选股器
+python scripts/monthly_live.py                 # 每日盘后运行，模拟止损
 ```
 
 `monthly_live.py` 每天运行一次，自动判断：

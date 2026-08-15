@@ -67,8 +67,28 @@ def select_picks(selector, codes, ind_map, today):
     return picks
 
 
+def code_to_ts(code):
+    """股票代码转 tushare ts_code"""
+    s = str(code).zfill(6)
+    return f"{s}.SH" if s[0] == '6' else f"{s}.SZ"
+
+
+def get_realtime_price(code, trade_date):
+    """用 tushare 实时查某股票某天收盘价（失败返回 None）"""
+    try:
+        import tushare as ts
+        from config.settings import TUSHARE_TOKEN
+        pro = ts.pro_api(TUSHARE_TOKEN, timeout=10)
+        df = pro.daily(ts_code=code_to_ts(code), trade_date=trade_date.strftime('%Y%m%d'))
+        if df is not None and len(df) > 0:
+            return float(df['close'].iloc[0])
+    except Exception:
+        pass
+    return None
+
+
 def get_price(code, today):
-    """获取某股票截至 today 的最新收盘价（缓存）"""
+    """获取某股票截至 today 的最新收盘价（缓存优先，tushare 实时补今天）"""
     df = load_from_cache(code)
     if df is None or len(df) == 0:
         return None
@@ -76,6 +96,15 @@ def get_price(code, today):
     row = df[df['Date'] <= today]
     if len(row) == 0:
         return None
+    cache_last = row['Date'].iloc[-1]
+    # 缓存已更新到今天 → 用缓存
+    if cache_last.normalize() == today.normalize():
+        return float(row['Close'].iloc[-1])
+    # 缓存滞后 → 用 tushare 实时查今天收盘价
+    px = get_realtime_price(code, today)
+    if px is not None:
+        return px
+    # fallback：缓存最新收盘价
     return float(row['Close'].iloc[-1])
 
 
