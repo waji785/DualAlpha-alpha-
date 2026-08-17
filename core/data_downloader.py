@@ -317,14 +317,27 @@ class DataDownloader:
         else:
             self.stats['validated_ok'] += 1
 
-        # ---- 财务指标 merge（从批量缓存，quarter → daily 前向填充）----
+        # ---- 另类数据 merge（财务 + 融资融券 + 龙虎榜 + 大宗交易）----
+        df = self._merge_alt_data(df, stock_code)
+
+        # 特征
+        df = construct_features(df)
+        df = clean_data(df)
+
+        cache_file = os.path.join(self.cache_dir, f"{stock_code}.parquet")
+        df.to_parquet(cache_file, index=False)
+        self.stats['success'] += 1
+        return True
+
+    def _merge_alt_data(self, df, stock_code):
+        """merge 财务 + 融资融券 + 龙虎榜 + 大宗交易（全量下载和增量更新共用）"""
+        s = stock_code.zfill(6)
+        ts_code = f"{s}.SH" if s[0] == '6' else f"{s}.SZ"
+        # 财务指标（ann_date 前视修复）
         if self.fundamental_cache:
-            s = stock_code.zfill(6)
-            ts_code = f"{s}.SH" if s[0] == '6' else f"{s}.SZ"
             fund = self.fundamental_cache.get(ts_code)
             if fund is not None and len(fund) > 0:
                 f = fund.copy()
-                # 前视修复：用披露日期 ann_date 而非报告期 end_date（财报有 1-3 月披露滞后）
                 if 'ann_date' in f.columns:
                     f['Date'] = pd.to_datetime(f['ann_date'].fillna(f['end_date']))
                 else:
@@ -335,10 +348,7 @@ class DataDownloader:
                 df = df.merge(f, on='Date', how='left')
                 for c in ['ROE', 'GrossMargin', 'NetMargin', 'DebtRatio']:
                     df[c] = df[c].ffill().fillna(0.0)
-
-        # ---- 融资融券 merge（日频，融资余额变化率）----
-        s = stock_code.zfill(6)
-        ts_code = f"{s}.SH" if s[0] == '6' else f"{s}.SZ"
+        # 融资融券
         m = self.margin_cache.get(ts_code) if getattr(self, 'margin_cache', None) else None
         if m is not None and len(m) > 0:
             mm = m.copy()
@@ -352,8 +362,7 @@ class DataDownloader:
         else:
             df['Margin_Chg_5d'] = 0.0
             df['Margin_Chg_20d'] = 0.0
-
-        # ---- 龙虎榜机构净买入 merge（事件数据，20 天累计）----
+        # 龙虎榜
         lhb = self.lhb_cache.get(ts_code) if getattr(self, 'lhb_cache', None) else None
         if lhb is not None and len(lhb) > 0:
             ll = lhb.copy()
@@ -364,8 +373,7 @@ class DataDownloader:
             df.drop(columns=['net_buy'], inplace=True)
         else:
             df['LHB_Net_Buy_20d'] = 0.0
-
-        # ---- 大宗交易金额 merge（事件数据，20 天累计）----
+        # 大宗交易
         blk = self.block_cache.get(ts_code) if getattr(self, 'block_cache', None) else None
         if blk is not None and len(blk) > 0:
             bb = blk.copy()
@@ -376,15 +384,7 @@ class DataDownloader:
             df.drop(columns=['amount'], inplace=True)
         else:
             df['Block_Amount_20d'] = 0.0
-
-        # 特征
-        df = construct_features(df)
-        df = clean_data(df)
-
-        cache_file = os.path.join(self.cache_dir, f"{stock_code}.parquet")
-        df.to_parquet(cache_file, index=False)
-        self.stats['success'] += 1
-        return True
+        return df
 
     # ============================================================
     #  Validation
@@ -495,7 +495,7 @@ class DataDownloader:
         return cache
 
     def _load_margin(self):
-        """加载融资融券数据（按日期循环，磁盘缓存），返回 dict{ts_code: DataFrame}"""
+        """加载融资融券数据（增量更新：缓存存在则下载最新几天合并），返回 dict{ts_code: DataFrame}"""
         from config.settings import TUSHARE_TOKEN
         if not _TS_AVAILABLE or TUSHARE_TOKEN == "your_token_here":
             logger.warning("tushare 不可用，跳过融资融券数据")
@@ -505,14 +505,20 @@ class DataDownloader:
         if os.path.exists(cache_file):
             try:
                 full = pd.read_parquet(cache_file)
-                logger.info(f"融资融券从缓存加载: {len(full)} 行")
             except Exception:
                 full = None
-        if full is None:
-            pro = ts.pro_api(TUSHARE_TOKEN, timeout=10)
-            cal = pro.trade_cal(exchange='SSE', start_date=self.start.replace('-', ''),
-                                end_date=self.end.replace('-', ''), is_open='1')
-            trade_dates = cal['cal_date'].tolist()
+        # 增量起始日期：缓存最新日期 + 1 天，否则从年初
+        if full is not None and len(full) > 0:
+            last_date = str(full['trade_date'].max())
+            start_date = (pd.to_datetime(last_date) + pd.Timedelta(days=1)).strftime('%Y%m%d')
+        else:
+            start_date = self.start.replace('-', '')[:4] + '0101'
+        end_date = self.end.replace('-', '')
+        # 增量下载（仅下载缓存之后的新交易日）
+        pro = ts.pro_api(TUSHARE_TOKEN, timeout=10)
+        cal = pro.trade_cal(exchange='SSE', start_date=start_date, end_date=end_date, is_open='1')
+        trade_dates = cal['cal_date'].tolist()
+        if trade_dates:
             frames = []
             for td in tqdm(trade_dates, desc='下载融资融券'):
                 try:
@@ -523,9 +529,11 @@ class DataDownloader:
                     pass
                 time.sleep(0.3)
             if frames:
-                full = pd.concat(frames, ignore_index=True)
+                new_df = pd.concat(frames, ignore_index=True)
+                full = pd.concat([full, new_df], ignore_index=True).drop_duplicates(
+                    ['ts_code', 'trade_date'], keep='last') if full is not None else new_df
                 full.to_parquet(cache_file, index=False)
-                logger.info(f"融资融券已缓存: {cache_file} ({len(full)} 行)")
+                logger.info(f"融资融券已缓存: {len(full)} 行")
         if full is None:
             return {}
         margin_dict = {}
@@ -535,7 +543,7 @@ class DataDownloader:
         return margin_dict
 
     def _load_lhb(self):
-        """下载龙虎榜机构净买入（top_inst），返回 dict{ts_code: DataFrame(trade_date, net_buy)}"""
+        """下载龙虎榜机构净买入（增量更新），返回 dict{ts_code: DataFrame(trade_date, net_buy)}"""
         from config.settings import TUSHARE_TOKEN
         if not _TS_AVAILABLE or TUSHARE_TOKEN == "your_token_here":
             return {}
@@ -544,14 +552,18 @@ class DataDownloader:
         if os.path.exists(cache_file):
             try:
                 full = pd.read_parquet(cache_file)
-                logger.info(f"龙虎榜从缓存加载: {len(full)} 行")
             except Exception:
                 full = None
-        if full is None:
-            pro = ts.pro_api(TUSHARE_TOKEN, timeout=10)
-            cal = pro.trade_cal(exchange='SSE', start_date=self.start.replace('-', ''),
-                                end_date=self.end.replace('-', ''), is_open='1')
-            trade_dates = cal['cal_date'].tolist()
+        if full is not None and len(full) > 0:
+            last_date = str(full['trade_date'].max())
+            start_date = (pd.to_datetime(last_date) + pd.Timedelta(days=1)).strftime('%Y%m%d')
+        else:
+            start_date = self.start.replace('-', '')[:4] + '0101'
+        end_date = self.end.replace('-', '')
+        pro = ts.pro_api(TUSHARE_TOKEN, timeout=10)
+        cal = pro.trade_cal(exchange='SSE', start_date=start_date, end_date=end_date, is_open='1')
+        trade_dates = cal['cal_date'].tolist()
+        if trade_dates:
             frames = []
             for td in tqdm(trade_dates, desc='下载龙虎榜'):
                 try:
@@ -564,7 +576,9 @@ class DataDownloader:
                     pass
                 time.sleep(0.3)
             if frames:
-                full = pd.concat(frames, ignore_index=True)
+                new_df = pd.concat(frames, ignore_index=True)
+                full = pd.concat([full, new_df], ignore_index=True).drop_duplicates(
+                    ['ts_code', 'trade_date'], keep='last') if full is not None else new_df
                 full.to_parquet(cache_file, index=False)
                 logger.info(f"龙虎榜已缓存: {len(full)} 行")
         if full is None:
@@ -576,7 +590,7 @@ class DataDownloader:
         return lhb_dict
 
     def _load_block(self):
-        """下载大宗交易金额（block_trade），返回 dict{ts_code: DataFrame(trade_date, amount)}"""
+        """下载大宗交易金额（增量更新），返回 dict{ts_code: DataFrame(trade_date, amount)}"""
         from config.settings import TUSHARE_TOKEN
         if not _TS_AVAILABLE or TUSHARE_TOKEN == "your_token_here":
             return {}
@@ -585,14 +599,18 @@ class DataDownloader:
         if os.path.exists(cache_file):
             try:
                 full = pd.read_parquet(cache_file)
-                logger.info(f"大宗交易从缓存加载: {len(full)} 行")
             except Exception:
                 full = None
-        if full is None:
-            pro = ts.pro_api(TUSHARE_TOKEN, timeout=10)
-            cal = pro.trade_cal(exchange='SSE', start_date=self.start.replace('-', ''),
-                                end_date=self.end.replace('-', ''), is_open='1')
-            trade_dates = cal['cal_date'].tolist()
+        if full is not None and len(full) > 0:
+            last_date = str(full['trade_date'].max())
+            start_date = (pd.to_datetime(last_date) + pd.Timedelta(days=1)).strftime('%Y%m%d')
+        else:
+            start_date = self.start.replace('-', '')[:4] + '0101'
+        end_date = self.end.replace('-', '')
+        pro = ts.pro_api(TUSHARE_TOKEN, timeout=10)
+        cal = pro.trade_cal(exchange='SSE', start_date=start_date, end_date=end_date, is_open='1')
+        trade_dates = cal['cal_date'].tolist()
+        if trade_dates:
             frames = []
             for td in tqdm(trade_dates, desc='下载大宗交易'):
                 try:
@@ -605,7 +623,9 @@ class DataDownloader:
                     pass
                 time.sleep(0.3)
             if frames:
-                full = pd.concat(frames, ignore_index=True)
+                new_df = pd.concat(frames, ignore_index=True)
+                full = pd.concat([full, new_df], ignore_index=True).drop_duplicates(
+                    ['ts_code', 'trade_date'], keep='last') if full is not None else new_df
                 full.to_parquet(cache_file, index=False)
                 logger.info(f"大宗交易已缓存: {len(full)} 行")
         if full is None:
@@ -705,6 +725,13 @@ class DataDownloader:
             logger.info("所有股票已是最新")
             return
 
+        # 加载另类数据 cache（供增量更新 merge，避免抹掉财务/融资融券/龙虎榜/大宗交易因子）
+        if need_update:
+            self.fundamental_cache = self._load_fundamentals([c for c, _ in need_update])
+            self.margin_cache = self._load_margin()
+            self.lhb_cache = self._load_lhb()
+            self.block_cache = self._load_block()
+
         # 增量下载截止日：17:00 后用今天（数据已发布），否则昨天
         now = pd.Timestamp.now()
         if now.hour >= 17:
@@ -753,6 +780,8 @@ class DataDownloader:
             else:
                 self.stats['validated_ok'] += 1
 
+            # merge 另类数据（财务+融资融券+龙虎榜+大宗交易），避免增量更新抹掉这些因子
+            combined = self._merge_alt_data(combined, code)
             combined = construct_features(combined)
             combined = clean_data(combined)
             combined.to_parquet(cache_file, index=False)

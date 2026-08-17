@@ -116,8 +116,28 @@ def log_trade(code, name, action, price, date, detail=""):
         row.to_csv(TRADE_LOG, index=False, encoding='utf-8-sig')
 
 
+def is_trading_day(date):
+    """判断是否交易日：周末直接跳过，工作日用 tushare 交易日历验证"""
+    if date.dayofweek >= 5:  # 5=周六, 6=周日
+        return False
+    try:
+        import tushare as ts
+        from config.settings import TUSHARE_TOKEN
+        pro = ts.pro_api(TUSHARE_TOKEN, timeout=10)
+        d = date.strftime('%Y%m%d')
+        df = pro.trade_cal(exchange='SSE', start_date=d, end_date=d)
+        if df is not None and len(df) > 0:
+            return int(df['is_open'].iloc[0]) == 1
+    except Exception:
+        pass
+    return True  # tushare 失败时默认按交易日处理（周末已排除）
+
+
 def main():
     today = pd.Timestamp(TODAY)
+    if not is_trading_day(today):
+        logger.info(f"{today.date()} 非交易日（周末/节假日），跳过")
+        return
     logger.info(f"===== 月度实盘 {today.date()} =====")
 
     # 1. 加载选股器
@@ -178,7 +198,11 @@ def main():
             log_trade(code, name_map.get(code, ''), '买入', px, today)
         positions = new_positions
         last_rebalance = str(today.date())
-        logger.info(f"新持仓 {len(positions)} 只: {list(positions.keys())}")
+        pos_str = ", ".join(f"{c}({p.get('name','')})" for c, p in positions.items())
+        logger.info(f"新持仓 {len(positions)} 只: {pos_str}")
+        print(f"\n持仓清单:")
+        for c, p in positions.items():
+            print(f"  {c} {p.get('name','')} @ {p['buy_price']:.2f}")
     else:
         # 持有期：检查止损
         for code, pos in list(positions.items()):
